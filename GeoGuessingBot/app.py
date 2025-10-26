@@ -1,5 +1,5 @@
-# app.py — StreetCLIP Geo Bot (no duplicate toasts; old scoring; F6 one-shot)
-# Run:  streamlit run app.py  (Windows 10/11)
+# app.py — StreetCLIP Geo Bot (no Windows toasts; uses Streamlit toasts)
+# Run:  streamlit run app.py
 
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -17,8 +17,18 @@ try:
 except Exception:
     _IMAGEGRAB_AVAILABLE = False
 
-import mss
-from pynput import keyboard
+# --- Optional/host-specific deps (guarded so cloud won't crash) ---
+try:
+    import mss
+    HAVE_MSS = True
+except Exception:
+    HAVE_MSS = False
+
+try:
+    from pynput import keyboard
+    HAVE_PYNPUT = True
+except Exception:
+    HAVE_PYNPUT = False
 
 import torch
 from transformers import CLIPModel, CLIPProcessor, CLIPTokenizerFast, CLIPImageProcessor
@@ -26,8 +36,7 @@ from transformers import CLIPModel, CLIPProcessor, CLIPTokenizerFast, CLIPImageP
 import folium
 from streamlit_folium import st_folium
 
-from windows_toasts import WindowsToaster, Toast
-from streamlit.runtime.scriptrunner import add_script_run_ctx
+# from streamlit.runtime.scriptrunner import add_script_run_ctx  # optional; guarded below
 
 # ---- Your geo tables (unchanged) ----
 from geo_tables import (
@@ -37,7 +46,7 @@ from geo_tables import (
 )
 
 # ---------- Streamlit page ----------
-st.set_page_config(page_title="StreetCLIP — F6 screenshot + Windows toast", layout="wide")
+st.set_page_config(page_title="StreetCLIP — F6 screenshot + Streamlit toasts", layout="wide")
 
 # ---------- Paths / persistence ----------
 BASE_DIR   = Path("geograb_data")
@@ -92,6 +101,8 @@ def safe_open_image(path: Path, attempts: int = 10, sleep: float = 0.1):
 
 # ---------- Screenshot + crop ----------
 def fullscreen_capture_crop(cfg) -> Image.Image:
+    if not HAVE_MSS:
+        raise RuntimeError("Screen capture (mss) is unavailable on this environment. Use file upload instead.")
     with mss.mss() as sct:
         mon = sct.monitors[1]
         raw = sct.grab(mon)
@@ -166,13 +177,13 @@ def predict_hier(image: Image.Image, topk_countries=5, topk_regions=6, topk_citi
         "cities": cities,
     }
 
-# ---------- Toasts (with cooldown) ----------
-_toaster = WindowsToaster("StreetCLIP Geo Bot")
+# ---------- Streamlit toasts (replacement for Windows toasts) ----------
 _TOAST_LOCK = threading.Lock()
 _LAST_TOAST_MS = 0.0
-TOAST_COOLDOWN_MS = 600  # avoid back-to-back duplicate Windows notifications
+TOAST_COOLDOWN_MS = 600  # ms
 
 def toast(lines):
+    """Show a rate-limited toast inside Streamlit (cross-platform)."""
     global _LAST_TOAST_MS
     now = time.time() * 1000.0
     with _TOAST_LOCK:
@@ -180,9 +191,11 @@ def toast(lines):
             return
         _LAST_TOAST_MS = now
     try:
-        t = Toast(); t.text_fields = lines; _toaster.show_toast(t)
+        msg = "\n".join(lines) if isinstance(lines, (list, tuple)) else str(lines)
+        st.toast(msg, icon="🗺️")
     except Exception:
-        pass
+        # As a fallback, write to the page (non-blocking)
+        st.info(msg)
 
 def send_result_toast(pred):
     continent, cont_scores = pred.get("continent") or (None, [])
@@ -228,14 +241,14 @@ def _handle_capture_and_predict():
 
         send_result_toast(pred)
     except Exception as e:
-        toast([f"F6 capture failed: {e!r}"])
+        toast([f"Capture failed: {e!r}"])
     finally:
         _PROCESSING.release()
 
 def _on_key_press(key):
     global _LAST_F6_MS
     try:
-        if key == keyboard.Key.f6:
+        if getattr(key, "vk", None) == 0x75 or str(key) in ("Key.f6", "<96>"):  # robust F6 detect
             now = time.time() * 1000.0
             if now - _LAST_F6_MS < DEBOUNCE_MS:
                 return
@@ -246,18 +259,27 @@ def _on_key_press(key):
 
 # ---------- Listener: make it a session singleton ----------
 def _start_listener_once():
+    if not HAVE_PYNPUT:
+        st.warning("Hotkey listener (pynput) isn’t available here. Use the **Upload** button below to analyze images.")
+        return
+
     if "f6_thread" in st.session_state:
         t = st.session_state["f6_thread"]
         if isinstance(t, threading.Thread) and t.is_alive():
             return  # already running
 
     def _keyboard_loop():
-        with keyboard.Listener(on_press=_on_key_press) as l:
-            l.join()
+        try:
+            with keyboard.Listener(on_press=_on_key_press) as l:
+                l.join()
+        except Exception as e:
+            toast([f"Listener stopped: {e!r}"])
 
     t = threading.Thread(target=_keyboard_loop, daemon=True, name="F6Listener")
     try:
-        add_script_run_ctx(t)  # silence ScriptRunContext warnings
+        # Late import so it doesn't explode on older runtimes
+        from streamlit.runtime.scriptrunner import add_script_run_ctx
+        add_script_run_ctx(t)
     except Exception:
         pass
     t.start()
@@ -266,7 +288,7 @@ def _start_listener_once():
 _start_listener_once()
 
 # ---------- UI ----------
-st.title("🗺️ StreetCLIP — press F6 to analyze one screenshot + Windows toast")
+st.title("🗺️ StreetCLIP — press F6 (local) or upload (cloud)")
 
 with st.expander("📐 Screenshot crop (margins in pixels)", expanded=True):
     m = CFG.get("margins_px", {})
@@ -278,7 +300,7 @@ with st.expander("📐 Screenshot crop (margins in pixels)", expanded=True):
     if st.button("Save margins"):
         CFG["margins_px"] = {"left": left, "right": right, "top": top, "bottom": bot}
         save_config(CFG)
-        st.success("Saved. Focus your game and press F6 to test.")
+        st.success("Saved. On desktop: focus your game and press F6. On cloud: use Upload below.")
 
 with _RUNTIME_LOCK:
     ltime = _LAST_TIME
@@ -286,14 +308,29 @@ with _RUNTIME_LOCK:
 
 st.subheader("Status")
 colA, colB, colC = st.columns(3)
-colA.metric("Hotkey listener", "Running")
+colA.metric("Hotkey listener", "Running" if HAVE_PYNPUT else "Unavailable")
 colB.metric("Last capture", "—" if not ltime else datetime.fromtimestamp(ltime).strftime("%H:%M:%S"))
 colC.metric("Saved image", LAST_JPG.name if LAST_JPG.exists() else "—")
+
+# --- Cloud-friendly fallback: upload an image to analyze ---
+st.markdown("### 📤 Upload image (cloud-friendly)")
+up = st.file_uploader("Upload a screenshot to analyze", type=["png", "jpg", "jpeg"])
+if up is not None:
+    try:
+        img_u = Image.open(up).convert("RGB")
+        pred_u = predict_hier(img_u, 5, 6, 8)
+        _LAST_PRED = pred_u
+        _LAST_TIME = time.time()
+        st.success("Uploaded image processed.")
+        send_result_toast(pred_u)
+        img_u.save(LAST_JPG, quality=92)
+    except Exception as e:
+        st.error(f"Failed to process uploaded image: {e!r}")
 
 left, right = st.columns([0.46, 0.54], gap="large")
 
 with left:
-    st.write("**Last screenshot** (press F6 to capture):")
+    st.write("**Last screenshot / uploaded image**")
     if LAST_JPG.exists():
         img = safe_open_image(LAST_JPG)
         if img is not None:
@@ -301,27 +338,31 @@ with left:
         else:
             st.caption("…writing image, refresh in a moment.")
     else:
-        st.info("No screenshot yet. Focus your game window and press **F6**.")
+        if HAVE_MSS:
+            st.info("No image yet. Focus your game and press **F6**.")
+        else:
+            st.info("No image yet. Use **Upload** above to analyze an image.")
 
 with right:
     st.write("**Last prediction** (hierarchical)")
-    if pred:
-        continent, cont_scores = pred["continent"]
+    if _LAST_PRED:
+        continent, cont_scores = _LAST_PRED["continent"]
         st.write("🌍 **Continent**", {lbl: round(p*100,2) for lbl, p in cont_scores})
-        if pred["countries"]:
-            st.write("🏳️ **Countries (top-5)**", {lbl: round(p*100,2) for lbl, p in pred["countries"]})
-        if pred["regions"]:
-            st.write("🗺️ **Regions (top-6)**", {lbl: round(p*100,2) for lbl, p in pred["regions"]})
-        if pred["cities"]:
-            st.write("🏙️ **Cities (top-8)**", {lbl: round(p*100,2) for lbl, p in pred["cities"]})
+        if _LAST_PRED["countries"]:
+            st.write("🏳️ **Countries (top-5)**", {lbl: round(p*100,2) for lbl, p in _LAST_PRED["countries"]})
+        if _LAST_PRED["regions"]:
+            st.write("🗺️ **Regions (top-6)**", {lbl: round(p*100,2) for lbl, p in _LAST_PRED["regions"]})
+        if _LAST_PRED["cities"]:
+            st.write("🏙️ **Cities (top-8)**", {lbl: round(p*100,2) for lbl, p in _LAST_PRED["cities"]})
 
 # Map pin for best guess
 m = folium.Map(location=[0, 0], zoom_start=2)
-if pred:
-    cont = pred["continent"][0] if pred["continent"] else None
-    best_country = pred["region_country"]
-    best_city = pred["cities"][0][0] if pred["cities"] else None
-    best_region = pred["regions"][0][0] if pred["regions"] else None
+pred_map = _LAST_PRED
+if pred_map:
+    cont = pred_map["continent"][0] if pred_map["continent"] else None
+    best_country = pred_map["region_country"]
+    best_city = pred_map["cities"][0][0] if pred_map["cities"] else None
+    best_region = pred_map["regions"][0][0] if pred_map["regions"] else None
     if best_city:
         label = best_city
         lat, lon = centroid_for(best_city, continent_hint=cont, country_hint=best_country)
@@ -345,4 +386,4 @@ if pred:
 
 st_folium(m, width=900, height=560)
 
-st.caption("Keep this app running. Focus your game, press **F6** → single capture toast, single result toast.")
+st.caption("Keep this app running. On desktop: focus your game and press **F6**. On cloud: upload an image. Notifications are shown as Streamlit toasts in the bottom-right.")
