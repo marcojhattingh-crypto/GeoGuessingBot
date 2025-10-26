@@ -1,0 +1,15 @@
+{
+  "mode": "margins_px",
+  "margins_px": {
+    "left": 0,
+    "right": 0,
+    "top": 160,
+    "bottom": 75
+  },
+  "relative": {
+    "x0": 0.02,
+    "y0": 0.12,
+    "w": 0.96,
+    "h": 0.76
+  }
+}
